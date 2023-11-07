@@ -1,8 +1,24 @@
 FROM rust:1.74 as builder
 WORKDIR /usr/src/cse138
 
+# Start of cache to trick Docker and remember to comment out "Start of comment the below..."
+# Copying the Cargo files separately to cache dependencies
+COPY Cargo.toml Cargo.lock ./
+
+# Placeholder source file to compile dependencies
+RUN mkdir src && echo "fn main() {}" > src/main.rs && cargo build --release
+
+# Copy the actual source files and recompile
+# This should be fast if only source files change
+
 COPY src/ src/
 RUN touch src/main.rs && cargo build --release
+# End of cache to trick Docker
+
+# # Start of comment the below out if using start of cache to trick Docker
+# COPY . . 
+# RUN cargo build --release
+# # End of comment the below out if using start of cache to trick Docker
 
 FROM debian:bookworm-slim
 COPY --from=builder /usr/src/cse138/target/release/pa3 /usr/local/bin/pa3
