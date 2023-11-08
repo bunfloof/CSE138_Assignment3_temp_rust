@@ -1,4 +1,4 @@
-use actix_web::{delete, get, put, web, App, HttpResponse, HttpServer, Responder};
+use actix_web::{delete, get, put, web, App, HttpResponse, HttpServer, Responder, HttpRequest};
 use log::{info, error};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -8,7 +8,6 @@ use std::env;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::time::interval;
-use tokio::sync::RwLock;
 
 #[derive(Serialize, Deserialize)]
 struct KeyValue {
@@ -29,138 +28,17 @@ struct DeleteRequest {
     causal_metadata: Option<HashMap<String, u64>>,
 }
 
-#[derive(Deserialize, Debug)]
-struct HeartbeatRequest {
+#[derive(Serialize, Deserialize)]
+struct Heartbeat {
     socket_address: String,
-}
-
-#[derive(Deserialize)]
-struct ViewChangeRequest {
-    socket_address: String,
-}
-
-#[derive(Deserialize, Debug)]
-struct InternalViewChangeRequest {
-    socket_address: String,
-    action: String,
 }
 
 struct AppState {
     store: Mutex<HashMap<String, serde_json::Value>>,
     vector_clock: Arc<Mutex<HashMap<String, u64>>>,
+    replicas: Arc<Mutex<Vec<String>>>, // Now wrapped in Arc
     socket_address: String,
-    replicas: Vec<String>, // Static list of all possible replicas
-    view: Arc<Mutex<Vec<String>>>, // Dynamic list of active replicas
-    last_heartbeat_received: Arc<RwLock<HashMap<String, Instant>>>,
-}
-
-async fn send_heartbeats(app_state: web::Data<AppState>) {
-    let mut interval = interval(Duration::from_millis(1000));
-    let client = Client::new();
-
-    loop {
-        interval.tick().await;
-        let replicas = app_state.replicas.clone();
-
-        for replica in &replicas {
-            if replica != &app_state.socket_address {
-                let url = format!("http://{}/heartbeat", replica);
-                let payload = json!({ "socket_address": app_state.socket_address });
-                let payload_str = serde_json::to_string(&payload).unwrap_or_else(|_| "Failed to serialize".to_string());
-
-                let response = client.put(&url).body(payload_str).send().await;
-                match response {
-                    Ok(response) => info!("[{}] Sent heartbeat to {}: {:?}", Instant::now().elapsed().as_millis(), replica, response),
-                    Err(e) => error!("[{}] Error sending heartbeat to {}: {}", Instant::now().elapsed().as_millis(), replica, e),
-                }
-            }
-        }
-    }
-}
-
-#[put("/heartbeat")]
-async fn heartbeat(req_body: String, data: web::Data<AppState>) -> impl Responder {
-    let req: HeartbeatRequest = match serde_json::from_str(&req_body) {
-        Ok(req) => req,
-        Err(e) => return HttpResponse::BadRequest().body(format!("Invalid JSON: {}", e)),
-    };
-
-    let sender_address = &req.socket_address;
-    if sender_address.is_empty() {
-        return HttpResponse::BadRequest().body("Empty socket address");
-    }
-
-    // Process the heartbeat asynchronously
-    tokio::spawn(process_heartbeat(data.clone(), sender_address.clone()));
-
-    HttpResponse::Ok().finish()
-}
-
-async fn process_heartbeat(app_state: web::Data<AppState>, sender_address: String) {
-    let current_time = Instant::now();
-
-    {
-        let mut last_heartbeat_received = app_state.last_heartbeat_received.write().await;
-        last_heartbeat_received.insert(sender_address.clone(), current_time);
-    }
-
-    let mut view = app_state.view.lock().unwrap();
-    if !view.contains(&sender_address) {
-        view.push(sender_address.clone());
-        log::info!("Replica {} re-added to view.", sender_address);
-    }
-    // No need for broadcast here as the view is updated internally
-}
-
-async fn process_view_removal(app_state: &web::Data<AppState>, replica: &String) {
-    {
-        // Restrict the scope of the MutexGuard cum
-        {
-            let mut view = app_state.view.lock().unwrap();
-            view.retain(|r| r != replica);
-        }
-
-        {
-            let mut last_heartbeat_received = app_state.last_heartbeat_received.write().await;
-            last_heartbeat_received.remove(replica);
-        }
-
-        log::info!("Removing replica: {}", replica);
-    }
-
-    // Broadcasting view changes - this is now outside the scope of the MutexGuard cum
-    broadcast_view_change("delete", replica, &app_state).await;
-}
-
-
-// Function to check a single replica's failure
-async fn check_replica_failure(app_state: web::Data<AppState>, replica: String) {
-    let heartbeat_timeout = Duration::from_millis(3000);
-    let mut interval = tokio::time::interval(Duration::from_millis(1000));
-
-    loop {
-        interval.tick().await;
-        let now = Instant::now();
-        let last_heartbeat_time = {
-            let last_heartbeat_received = app_state.last_heartbeat_received.read().await;
-            last_heartbeat_received.get(&replica).cloned()
-        };
-
-        if let Some(last_time) = last_heartbeat_time {
-            let elapsed = now.duration_since(last_time);
-            if elapsed > heartbeat_timeout {
-                info!("Heartbeat timeout for replica {}. Elapsed: {:?}", replica, elapsed);
-                let mut view = app_state.view.lock().unwrap();
-                if view.contains(&replica) {
-                    view.retain(|r| r != &replica);
-                    info!("Replica {} removed from view due to timeout.", replica);
-                }
-                break;
-            } else {
-                info!("Replica {} is alive. Elapsed since last heartbeat: {:?}", replica, elapsed);
-            }
-        }
-    }
+    last_heartbeat_received: Mutex<HashMap<String, Instant>>, // Tracking last heartbeat times
 }
 
 // Utility function to update the vector clock
@@ -192,6 +70,79 @@ fn is_causally_ready(local_clock: &HashMap<String, u64>, client_metadata: &HashM
     
     info!("Causally ready.");
     true
+}
+
+async fn send_heartbeats(state: web::Data<AppState>) {
+    let client = Client::new();
+    let mut interval = interval(Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        let replicas = state.replicas.lock().unwrap().clone();
+        for replica in &replicas {
+            if replica != &state.socket_address {
+                let replica_clone = replica.clone();
+                let state_clone = state.clone();
+                let client_clone = client.clone(); // Clone the client for each iteration
+                tokio::spawn(async move {
+                    let start = Instant::now();
+                    let result = client_clone.put(format!("http://{}/heartbeat", &replica_clone))
+                        .json(&Heartbeat {
+                            socket_address: state_clone.socket_address.clone(),
+                        })
+                        .timeout(Duration::from_millis(500)) // set a timeout of 500ms for the request
+                        .send()
+                        .await;
+                    let elapsed = start.elapsed();
+                    match result {
+                        Ok(_) => info!("Heartbeat sent to {} successfully in {:?}", replica_clone, elapsed),
+                        Err(e) => error!("Error sending heartbeat to {}: {} (took {:?})", replica_clone, e, elapsed),
+                    }
+                });
+            }
+        }
+    }
+}
+
+async fn check_for_failed_replicas(state: web::Data<AppState>) {
+    let mut interval = interval(Duration::from_secs(1));
+    loop {
+        interval.tick().await;
+        let now = Instant::now();
+        let mut last_heartbeat_received = state.last_heartbeat_received.lock().unwrap();
+        let mut replicas = state.replicas.lock().unwrap();
+
+        // Filter out replicas that are considered down
+        replicas.retain(|replica| {
+            if replica == &state.socket_address {
+                true // Always keep the current replica
+            } else if let Some(last_heartbeat) = last_heartbeat_received.get(replica) {
+                if now.duration_since(*last_heartbeat) <= Duration::from_secs(3) {
+                    true // Keep the replica, as it's within the heartbeat timeout
+                } else {
+                    info!("Replica {} is down and removed from view.", replica);
+                    false // Remove the replica
+                }
+            } else {
+                // If no heartbeat received yet, keep the replica for now
+                info!("No heartbeat received from {}, keeping in view for now.", replica);
+                true
+            }
+        });
+    }
+}
+
+
+#[put("/heartbeat")]
+async fn receive_heartbeat(req: web::Json<Heartbeat>, state: web::Data<AppState>) -> impl Responder {
+    let mut last_heartbeat_received = state.last_heartbeat_received.lock().unwrap();
+    last_heartbeat_received.insert(req.socket_address.clone(), Instant::now());
+    HttpResponse::Ok()
+}
+
+#[get("/view")]
+async fn get_view(state: web::Data<AppState>) -> impl Responder {
+    let replicas = state.replicas.lock().unwrap();
+    HttpResponse::Ok().json(&*replicas)
 }
 
 #[put("/kvs/{key}")]
@@ -289,52 +240,13 @@ async fn delete(key: web::Path<String>, req_body: web::Json<DeleteRequest>, data
     }
 }
 
-#[put("/view")]
-async fn add_to_view(req: web::Json<ViewChangeRequest>, data: web::Data<AppState>) -> impl Responder {
-    let new_replica = &req.socket_address;
-    let mut view = data.view.lock().unwrap();
-    log::info!("Before adding, view: {:?}", *view);
-
-    if view.contains(new_replica) {
-        HttpResponse::Ok().json(json!({ "result": "already present" }))
-    } else {
-        view.push(new_replica.clone());
-        log::info!("After adding, view: {:?}", *view);
-        broadcast_view_change("add", new_replica, &data).await;
-        HttpResponse::Created().json(json!({ "result": "added" }))
-    }
-}
-
-#[get("/view")]
-async fn get_view(data: web::Data<AppState>) -> impl Responder {
-    log::info!("Accessing current view");
-    let view_clone = {
-        let view = data.view.lock().unwrap();
-        log::info!("Current view: {:?}", *view);
-        view.clone()
-    };
-    HttpResponse::Ok().json(json!({ "view": view_clone }))
-}
-
-#[delete("/view")]
-async fn remove_from_view(req: web::Json<ViewChangeRequest>, data: web::Data<AppState>) -> impl Responder {
-    let replica_to_remove = &req.socket_address;
-    let mut view = data.view.lock().unwrap();
-
-    if let Some(index) = view.iter().position(|r| r == replica_to_remove) {
-        view.remove(index);
-        broadcast_view_change("delete", replica_to_remove, &data).await;
-        HttpResponse::Ok().json(json!({ "result": "deleted" }))
-    } else {
-        HttpResponse::NotFound().json(json!({ "error": "View has no such replica" }))
-    }
-}
-
 async fn broadcast_write(method: &str, key: &str, data: &KeyValue, app_state: &web::Data<AppState>) -> Result<(), reqwest::Error> {
     let client = Client::builder().timeout(Duration::from_secs(1)).build()?;
     let current_replica = &app_state.socket_address;
 
-    for replica in &app_state.replicas {
+    let replicas = app_state.replicas.lock().unwrap(); // Locking the replicas
+
+    for replica in replicas.iter() {
         if replica == current_replica {
             continue; // Skip broadcasting to itself
         }
@@ -358,24 +270,6 @@ async fn broadcast_write(method: &str, key: &str, data: &KeyValue, app_state: &w
     }
 
     Ok(())
-}
-
-async fn broadcast_view_change(action: &str, socket_address: &str, app_state: &web::Data<AppState>) {
-    let client = reqwest::Client::new();
-    let view_clone = {
-        let view_guard = app_state.view.lock().unwrap();
-        view_guard.clone()
-    };
-
-    for replica in view_clone.iter() {
-        if replica != &app_state.socket_address {
-            let url = format!("http://{}/internal/view", replica);
-            let _ = client.put(&url)
-                .json(&serde_json::json!({ "socket-address": socket_address, "action": action }))
-                .send()
-                .await;
-        }
-    }
 }
 
 #[put("/internal/kvs/{key}")]
@@ -411,97 +305,39 @@ async fn internal_delete(key: web::Path<String>, req_body: web::Json<DeleteReque
     }
 }
 
-#[put("/internal/view")]
-async fn internal_view_update(req: web::Json<InternalViewChangeRequest>, data: web::Data<AppState>) -> impl Responder {
-    let replica = &req.socket_address;
-    let action = &req.action;
-
-    log::info!("Internal view update request: {:?}", req);
-
-    let mut view = data.view.lock().unwrap();
-
-    match action.as_str() {
-        "add" => {
-            if !view.contains(replica) {
-                log::info!("Adding replica to view: {}", replica);
-                view.push(replica.clone());
-            }
-        },
-        "delete" => {
-            if view.contains(replica) {
-                log::info!("Removing replica from view: {}", replica);
-                view.retain(|r| r != replica);
-            }
-        },
-        _ => log::warn!("Unknown action: {}", action),
-    }
-
-    HttpResponse::Ok()
-}
-
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
     log::info!("Starting server...");
 
-
-    // Initialize the view from the VIEW environment variable
-    let view_str = env::var("VIEW").unwrap_or_default();
-    let initial_view: Vec<String> = view_str.split(',').map(String::from).collect();
-    log::info!("VIEW environment variable: {}", view_str);
-    log::info!("Initial view: {:?}", initial_view);
-
-    let initial_view_clone = initial_view.clone(); // Clone the initial_view
-
-    let vector_clock = initialize_vector_clock(&initial_view);
-    let last_heartbeat_received: HashMap<String, Instant> = initial_view.iter()
-        .map(|replica| (replica.clone(), Instant::now()))
-        .collect();
+    let view = env::var("VIEW").unwrap_or_default();
+    let replicas: Vec<String> = view.split(',').map(String::from).collect();
+    let vector_clock = initialize_vector_clock(&replicas);
 
     let socket_address = env::var("SOCKET_ADDRESS").unwrap_or_else(|_| "localhost".to_string());
     let port = env::var("PORT").unwrap_or_else(|_| "8090".to_string());
 
-    // Using the initial_view Vec directly for the dynamic list of active replicas
     let app_data = web::Data::new(AppState {
         store: Mutex::new(HashMap::new()),
         vector_clock: Arc::new(Mutex::new(vector_clock)),
-        socket_address: socket_address.clone(),
-        replicas: initial_view.clone(), // Static list of all possible replicas
-        view: Arc::new(Mutex::new(initial_view)), // Dynamic list of active replicas
-        last_heartbeat_received: Arc::new(RwLock::new(last_heartbeat_received)),
+        replicas: Arc::new(Mutex::new(replicas)),
+        socket_address,
+        last_heartbeat_received: Mutex::new(HashMap::new()),
     });
 
-    {
-        let app_state_clone = app_data.clone();
-        tokio::spawn(async move {
-            send_heartbeats(app_state_clone).await;
-        });
-    }
-
-    // Spawn separate tasks for each replica to check for failures
-    for replica in initial_view_clone.iter() {
-        if replica != &socket_address {
-            let app_state_clone = app_data.clone();
-            let replica_clone = replica.clone();
-            tokio::spawn(async move {
-                check_replica_failure(app_state_clone, replica_clone).await;
-            });
-        }
-    }
+    let heartbeat_handle = tokio::spawn(send_heartbeats(app_data.clone()));
+    let check_replicas_handle = tokio::spawn(check_for_failed_replicas(app_data.clone()));
 
     HttpServer::new(move || {
         App::new()
             .app_data(app_data.clone())
             .service(put)
             .service(get)
+            .service(get_view)
             .service(delete)
             .service(internal_put)
             .service(internal_delete)
-            .service(add_to_view)
-            .service(get_view)
-            .service(remove_from_view)
-            .service(internal_view_update)
-            .service(heartbeat)
+            .service(receive_heartbeat)
     })
     .bind(format!("0.0.0.0:{}", port))?
     .run()
