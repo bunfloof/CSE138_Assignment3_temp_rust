@@ -33,12 +33,25 @@ struct Heartbeat {
     socket_address: String,
 }
 
+#[derive(Deserialize)]
+struct InternalViewRequest {
+    #[serde(rename = "socket-address")]
+    socket_address: String,
+    action: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct StateResponse {
+    keyValueStore: HashMap<String, serde_json::Value>,
+    globalVectorClock: HashMap<String, u64>,
+}
+
 struct AppState {
     store: Mutex<HashMap<String, serde_json::Value>>,
     vector_clock: Arc<Mutex<HashMap<String, u64>>>,
-    replicas: Arc<Mutex<Vec<String>>>, // Now wrapped in Arc
+    replicas: Arc<Mutex<Vec<String>>>,
     socket_address: String,
-    last_heartbeat_received: Mutex<HashMap<String, Instant>>, // Tracking last heartbeat times
+    last_heartbeat_received: Mutex<HashMap<String, Instant>>,
 }
 
 // Utility function to update the vector clock
@@ -305,6 +318,90 @@ async fn internal_delete(key: web::Path<String>, req_body: web::Json<DeleteReque
     }
 }
 
+#[put("/internal/view")]
+async fn put_internal_view(req: web::Json<InternalViewRequest>, state: web::Data<AppState>) -> impl Responder {
+    let mut replicas = state.replicas.lock().unwrap();
+    let mut last_heartbeat_received = state.last_heartbeat_received.lock().unwrap();
+
+    match req.action.as_deref() {
+        Some("add") => {
+            if !replicas.contains(&req.socket_address) {
+                replicas.push(req.socket_address.clone());
+                last_heartbeat_received.insert(req.socket_address.clone(), Instant::now());
+            }
+        },
+        Some("delete") => {
+            replicas.retain(|replica| replica != &req.socket_address);
+            last_heartbeat_received.remove(&req.socket_address);
+        },
+        _ => (),
+    }
+
+    HttpResponse::Ok()
+}
+
+#[delete("/internal/view")]
+async fn delete_internal_view(req: web::Json<InternalViewRequest>, state: web::Data<AppState>) -> impl Responder {
+    let mut replicas = state.replicas.lock().unwrap();
+    let mut last_heartbeat_received = state.last_heartbeat_received.lock().unwrap();
+
+    replicas.retain(|replica| replica != &req.socket_address);
+    last_heartbeat_received.remove(&req.socket_address);
+
+    HttpResponse::Ok()
+}
+
+#[get("/internal/state")]
+async fn get_internal_state(state: web::Data<AppState>) -> impl Responder {
+    let store = state.store.lock().unwrap();
+    let vector_clock = state.vector_clock.lock().unwrap();
+
+    HttpResponse::Ok().json(json!({
+        "keyValueStore": &*store,
+        "globalVectorClock": &*vector_clock
+    }))
+}
+
+async fn announce_presence(state: web::Data<AppState>) {
+    let client = Client::new();
+    let current_replica = &state.socket_address;
+    let mut state_transferred = false;
+
+    let replicas = state.replicas.lock().unwrap().clone();
+    for replica in replicas.iter() {
+        if replica != current_replica {
+            if !state_transferred {
+                match client.get(format!("http://{}/internal/state", replica)).send().await {
+                    Ok(response) => {
+                        if let Ok(data) = response.json::<StateResponse>().await {
+                            let mut vector_clock = state.vector_clock.lock().unwrap();
+                            for (key, value) in data.globalVectorClock.iter() {
+                                vector_clock.entry(key.clone()).and_modify(|e| *e = std::cmp::max(*e, *value)).or_insert(*value);
+                            }
+
+                            let mut store = state.store.lock().unwrap();
+                            *store = data.keyValueStore;
+
+                            state_transferred = true;
+                        }
+                    },
+                    Err(e) => error!("Error requesting state from {}: {}", replica, e),
+                }
+            }
+
+            // Announce presence
+            let announcement = serde_json::json!({ "socket-address": current_replica, "action": "add" });
+            match client.put(format!("http://{}/internal/view", replica))
+                       .json(&announcement)
+                       .send()
+                       .await {
+                Ok(_) => info!("Announced presence to {}", replica),
+                Err(e) => error!("Error announcing presence to {}: {}", replica, e),
+            }
+        }
+    }
+}
+
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init();
@@ -328,9 +425,11 @@ async fn main() -> std::io::Result<()> {
     let heartbeat_handle = tokio::spawn(send_heartbeats(app_data.clone()));
     let check_replicas_handle = tokio::spawn(check_for_failed_replicas(app_data.clone()));
 
-    HttpServer::new(move || {
+    let app_data_for_server = app_data.clone();
+
+    let server = HttpServer::new(move || {
         App::new()
-            .app_data(app_data.clone())
+            .app_data(app_data_for_server.clone())
             .service(put)
             .service(get)
             .service(get_view)
@@ -338,10 +437,19 @@ async fn main() -> std::io::Result<()> {
             .service(internal_put)
             .service(internal_delete)
             .service(receive_heartbeat)
+            .service(put_internal_view)
+            .service(delete_internal_view)
+            .service(get_internal_state)
     })
     .bind(format!("0.0.0.0:{}", port))?
-    .run()
-    .await
+    .run();
+
+    let announce_handle = tokio::spawn(announce_presence(app_data));
+
+    // Wait for both the server and the announce_presence task
+    tokio::join!(server, announce_handle);
+
+    Ok(())
 }
 
 fn initialize_vector_clock(replicas: &[String]) -> HashMap<String, u64> {
