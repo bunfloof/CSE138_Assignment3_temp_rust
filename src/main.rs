@@ -34,6 +34,12 @@ struct Heartbeat {
 }
 
 #[derive(Deserialize)]
+struct ViewRequest {
+    #[serde(rename = "socket-address")]
+    socket_address: String,
+}
+
+#[derive(Deserialize)]
 struct InternalViewRequest {
     #[serde(rename = "socket-address")]
     socket_address: String,
@@ -155,7 +161,33 @@ async fn receive_heartbeat(req: web::Json<Heartbeat>, state: web::Data<AppState>
 #[get("/view")]
 async fn get_view(state: web::Data<AppState>) -> impl Responder {
     let replicas = state.replicas.lock().unwrap();
-    HttpResponse::Ok().json(&*replicas)
+    HttpResponse::Ok().json(json!({ "view": *replicas }))
+}
+
+#[put("/view")]
+async fn put_view(req: web::Json<ViewRequest>, state: web::Data<AppState>) -> impl Responder {
+    let mut replicas = state.replicas.lock().unwrap();
+
+    if !replicas.contains(&req.socket_address) {
+        replicas.push(req.socket_address.clone());
+        // broadcast view change not coems
+        HttpResponse::Created().json(json!({ "result": "added" }))
+    } else {
+        HttpResponse::Ok().json(json!({ "result": "already present" }))
+    }
+}
+
+#[delete("/view")]
+async fn delete_view(req: web::Json<ViewRequest>, state: web::Data<AppState>) -> impl Responder {
+    let mut replicas = state.replicas.lock().unwrap();
+
+    if let Some(pos) = replicas.iter().position(|r| r == &req.socket_address) {
+        replicas.remove(pos);
+        // broadcast view change not coems
+        HttpResponse::Ok().json(json!({ "result": "deleted" }))
+    } else {
+        HttpResponse::NotFound().json(json!({ "error": "View has no such replica" }))
+    }
 }
 
 #[put("/kvs/{key}")]
@@ -432,8 +464,10 @@ async fn main() -> std::io::Result<()> {
             .app_data(app_data_for_server.clone())
             .service(put)
             .service(get)
-            .service(get_view)
             .service(delete)
+            .service(get_view)
+            .service(put_view)
+            .service(delete_view)
             .service(internal_put)
             .service(internal_delete)
             .service(receive_heartbeat)
