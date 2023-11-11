@@ -1,5 +1,5 @@
-use actix_web::{delete, get, put, web, App, HttpResponse, HttpServer, Responder, HttpRequest};
-use log::{info, error};
+use actix_web::{delete, get, put, web, App, HttpResponse, HttpServer, Responder};
+use log::{error, info};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -48,8 +48,8 @@ struct InternalViewRequest {
 
 #[derive(Deserialize)]
 struct StateResponse {
-    keyValueStore: HashMap<String, serde_json::Value>,
-    globalVectorClock: HashMap<String, u64>,
+    key_value_store: HashMap<String, serde_json::Value>,
+    global_vector_clock: HashMap<String, u64>,
 }
 
 struct AppState {
@@ -57,12 +57,15 @@ struct AppState {
     vector_clock: Arc<Mutex<HashMap<String, u64>>>,
     replicas: Arc<Mutex<Vec<String>>>,
     socket_address: String,
-    last_heartbeat_received: Mutex<HashMap<String, Instant>>, // Tracking last heartbeat times
+    last_heartbeat_received: Mutex<HashMap<String, Instant>>,
 }
 
 // Utility function to initialize the vector clock
 fn initialize_vector_clock(replicas: &[String]) -> HashMap<String, u64> {
-    replicas.iter().map(|replica| (replica.clone(), 0)).collect()
+    replicas
+        .iter()
+        .map(|replica| (replica.clone(), 0))
+        .collect()
 }
 
 // Utility function to update the vector clock
@@ -73,7 +76,10 @@ fn update_vector_clock(clock: Arc<Mutex<HashMap<String, u64>>>, replica_id: &str
 }
 
 // Utility function to merge vector clocks
-fn merge_vector_clocks(local_clock: &mut HashMap<String, u64>, received_clock: &HashMap<String, u64>) {
+fn merge_vector_clocks(
+    local_clock: &mut HashMap<String, u64>,
+    received_clock: &HashMap<String, u64>,
+) {
     for (replica, count) in received_clock {
         let local_count = local_clock.entry(replica.clone()).or_default();
         *local_count = std::cmp::max(*local_count, *count);
@@ -81,17 +87,26 @@ fn merge_vector_clocks(local_clock: &mut HashMap<String, u64>, received_clock: &
 }
 
 // Utility function to check if causally ready
-fn is_causally_ready(local_clock: &HashMap<String, u64>, client_metadata: &HashMap<String, u64>) -> bool {
+fn is_causally_ready(
+    local_clock: &HashMap<String, u64>,
+    client_metadata: &HashMap<String, u64>,
+) -> bool {
     for (replica, client_count) in client_metadata {
         let local_count = local_clock.get(replica).unwrap_or(&0);
-        info!("Checking causal readiness for replica: {}. Local count: {}, Client count: {}", replica, local_count, client_count);
-        
+        info!(
+            "Checking causal readiness for replica: {}. Local count: {}, Client count: {}",
+            replica, local_count, client_count
+        );
+
         if local_count < client_count {
-            info!("Not causally ready. Replica {} is behind. Local count: {}, Client count: {}", replica, local_count, client_count);
+            info!(
+                "Not causally ready. Replica {} is behind. Local count: {}, Client count: {}",
+                replica, local_count, client_count
+            );
             return false;
         }
     }
-    
+
     info!("Causally ready.");
     true
 }
@@ -109,7 +124,8 @@ async fn send_heartbeats(state: web::Data<AppState>) {
                 let client_clone = client.clone(); // Clone the client for each iteration
                 tokio::spawn(async move {
                     let start = Instant::now();
-                    let result = client_clone.put(format!("http://{}/heartbeat", &replica_clone))
+                    let result = client_clone
+                        .put(format!("http://{}/heartbeat", &replica_clone))
                         .json(&Heartbeat {
                             socket_address: state_clone.socket_address.clone(),
                         })
@@ -118,8 +134,14 @@ async fn send_heartbeats(state: web::Data<AppState>) {
                         .await;
                     let elapsed = start.elapsed();
                     match result {
-                        Ok(_) => info!("Heartbeat sent to {} successfully in {:?}", replica_clone, elapsed),
-                        Err(e) => error!("Error sending heartbeat to {}: {} (took {:?})", replica_clone, e, elapsed),
+                        Ok(_) => info!(
+                            "Heartbeat sent to {} successfully in {:?}",
+                            replica_clone, elapsed
+                        ),
+                        Err(e) => error!(
+                            "Error sending heartbeat to {}: {} (took {:?})",
+                            replica_clone, e, elapsed
+                        ),
                     }
                 });
             }
@@ -132,7 +154,7 @@ async fn check_for_failed_replicas(state: web::Data<AppState>) {
     loop {
         interval.tick().await;
         let now = Instant::now();
-        let mut last_heartbeat_received = state.last_heartbeat_received.lock().unwrap();
+        let last_heartbeat_received = state.last_heartbeat_received.lock().unwrap();
         let mut replicas = state.replicas.lock().unwrap();
 
         // Filter out replicas that are considered down
@@ -147,8 +169,11 @@ async fn check_for_failed_replicas(state: web::Data<AppState>) {
                     false // Remove the replica
                 }
             } else {
-                // If no heartbeat received yet, keep the replica for now
-                info!("No heartbeat received from {}, keeping in view for now.", replica);
+                // If no initial heartbeat received yet, keep the replica for now
+                info!(
+                    "No heartbeat received from {}, keeping in view for now.",
+                    replica
+                );
                 true
             }
         });
@@ -156,7 +181,10 @@ async fn check_for_failed_replicas(state: web::Data<AppState>) {
 }
 
 #[put("/heartbeat")]
-async fn receive_heartbeat(req: web::Json<Heartbeat>, state: web::Data<AppState>) -> impl Responder {
+async fn receive_heartbeat(
+    req: web::Json<Heartbeat>,
+    state: web::Data<AppState>,
+) -> impl Responder {
     let mut last_heartbeat_received = state.last_heartbeat_received.lock().unwrap();
     last_heartbeat_received.insert(req.socket_address.clone(), Instant::now());
     HttpResponse::Ok()
@@ -207,7 +235,11 @@ async fn delete_view(req: web::Json<ViewRequest>, state: web::Data<AppState>) ->
 }
 
 #[put("/kvs/{key}")]
-async fn put(key: web::Path<String>, item: web::Json<KeyValue>, data: web::Data<AppState>) -> impl Responder {
+async fn put(
+    key: web::Path<String>,
+    item: web::Json<KeyValue>,
+    data: web::Data<AppState>,
+) -> impl Responder {
     let key_str = key.into_inner();
     info!("Received PUT request for key: {}", key_str);
 
@@ -217,12 +249,16 @@ async fn put(key: web::Path<String>, item: web::Json<KeyValue>, data: web::Data<
     }
 
     let mut store_lock = data.store.lock().unwrap();
-    
+
     {
         let vector_clock_lock = data.vector_clock.lock().unwrap();
-        if !is_causally_ready(&vector_clock_lock, item.causal_metadata.as_ref().unwrap_or(&HashMap::new())) {
+        if !is_causally_ready(
+            &vector_clock_lock,
+            item.causal_metadata.as_ref().unwrap_or(&HashMap::new()),
+        ) {
             info!("Not causally ready for key: {}", key_str);
-            return HttpResponse::ServiceUnavailable().json(json!({ "error": "Causal dependencies not satisfied; try again later" }));
+            return HttpResponse::ServiceUnavailable()
+                .json(json!({ "error": "Causal dependencies not satisfied; try again later" }));
         }
     }
 
@@ -231,16 +267,20 @@ async fn put(key: web::Path<String>, item: web::Json<KeyValue>, data: web::Data<
     let result = if store_lock.contains_key(&key_str) {
         info!("Replacing existing key: {}", key_str);
         store_lock.insert(key_str.clone(), item.value.clone());
-        HttpResponse::Ok().json(json!({ "result": "replaced", "causal-metadata": *data.vector_clock.lock().unwrap() }))
+        HttpResponse::Ok().json(
+            json!({ "result": "replaced", "causal-metadata": *data.vector_clock.lock().unwrap() }),
+        )
     } else {
         info!("Creating new key: {}", key_str);
         store_lock.insert(key_str.clone(), item.value.clone());
-        HttpResponse::Created().json(json!({ "result": "created", "causal-metadata": *data.vector_clock.lock().unwrap() }))
+        HttpResponse::Created().json(
+            json!({ "result": "created", "causal-metadata": *data.vector_clock.lock().unwrap() }),
+        )
     };
 
-    let broadcast_data = KeyValue { 
-        value: item.value.clone(), 
-        causal_metadata: Some(data.vector_clock.lock().unwrap().clone()) 
+    let broadcast_data = KeyValue {
+        value: item.value.clone(),
+        causal_metadata: Some(data.vector_clock.lock().unwrap().clone()),
     };
 
     let broadcast_result = broadcast_write("put", &key_str, &broadcast_data, &data).await;
@@ -252,14 +292,19 @@ async fn put(key: web::Path<String>, item: web::Json<KeyValue>, data: web::Data<
 }
 
 #[get("/kvs/{key}")]
-async fn get(key: web::Path<String>, data: web::Data<AppState>, req_body: web::Json<GetRequest>) -> impl Responder {
+async fn get(
+    key: web::Path<String>,
+    data: web::Data<AppState>,
+    req_body: web::Json<GetRequest>,
+) -> impl Responder {
     let key_str = key.into_inner();
     let causal_metadata = req_body.into_inner().causal_metadata;
 
     let store = data.store.lock().unwrap();
 
     if !is_causally_ready(&data.vector_clock.lock().unwrap(), &causal_metadata) {
-        return HttpResponse::ServiceUnavailable().json(json!({ "error": "Causal dependencies not satisfied; try again later" }));
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({ "error": "Causal dependencies not satisfied; try again later" }));
     }
 
     if let Some(value) = store.get(&key_str) {
@@ -270,23 +315,28 @@ async fn get(key: web::Path<String>, data: web::Data<AppState>, req_body: web::J
 }
 
 #[delete("/kvs/{key}")]
-async fn delete(key: web::Path<String>, req_body: web::Json<DeleteRequest>, data: web::Data<AppState>) -> impl Responder {
+async fn delete(
+    key: web::Path<String>,
+    req_body: web::Json<DeleteRequest>,
+    data: web::Data<AppState>,
+) -> impl Responder {
     let key_str = key.into_inner();
     let causal_metadata = req_body.into_inner().causal_metadata.unwrap_or_default();
 
     let mut store = data.store.lock().unwrap();
 
     if !is_causally_ready(&data.vector_clock.lock().unwrap(), &causal_metadata) {
-        return HttpResponse::ServiceUnavailable().json(json!({ "error": "Causal dependencies not satisfied; try again later" }));
+        return HttpResponse::ServiceUnavailable()
+            .json(json!({ "error": "Causal dependencies not satisfied; try again later" }));
     }
 
     update_vector_clock(data.vector_clock.clone(), &data.socket_address);
 
     let deletion_successful = store.remove(&key_str).is_some();
 
-    let broadcast_data = KeyValue { 
-        value: serde_json::Value::Null, 
-        causal_metadata: Some(data.vector_clock.lock().unwrap().clone()) 
+    let broadcast_data = KeyValue {
+        value: serde_json::Value::Null,
+        causal_metadata: Some(data.vector_clock.lock().unwrap().clone()),
     };
 
     let broadcast_result = broadcast_write("delete", &key_str, &broadcast_data, &data).await;
@@ -295,13 +345,19 @@ async fn delete(key: web::Path<String>, req_body: web::Json<DeleteRequest>, data
     }
 
     if deletion_successful {
-        HttpResponse::Ok().json(json!({ "result": "deleted", "causal-metadata": *data.vector_clock.lock().unwrap() }))
+        HttpResponse::Ok().json(
+            json!({ "result": "deleted", "causal-metadata": *data.vector_clock.lock().unwrap() }),
+        )
     } else {
         HttpResponse::NotFound().json(json!({ "error": "Key does not exist", "causal-metadata": *data.vector_clock.lock().unwrap() }))
     }
 }
 
-async fn broadcast_view_change(app_state: &web::Data<AppState>, method: &str, socket_address: &str) -> Result<(), reqwest::Error> {
+async fn broadcast_view_change(
+    app_state: &web::Data<AppState>,
+    method: &str,
+    socket_address: &str,
+) -> Result<(), reqwest::Error> {
     let client = Client::new();
     let current_replica = &app_state.socket_address;
 
@@ -315,7 +371,13 @@ async fn broadcast_view_change(app_state: &web::Data<AppState>, method: &str, so
             let payload = serde_json::json!({ "socket-address": socket_address, "action": method });
 
             let task = tokio::spawn(async move {
-                match client_clone.put(&url).json(&payload).timeout(Duration::from_secs(1)).send().await {
+                match client_clone
+                    .put(&url)
+                    .json(&payload)
+                    .timeout(Duration::from_secs(1))
+                    .send()
+                    .await
+                {
                     Ok(_) => info!("Broadcast to {} successful.", url),
                     Err(e) => error!("Error broadcasting view change to {}: {}", url, e),
                 }
@@ -333,9 +395,12 @@ async fn broadcast_view_change(app_state: &web::Data<AppState>, method: &str, so
     Ok(())
 }
 
-
-// Function to broadcast write operations with error handling and logging
-async fn broadcast_write(method: &str, key: &str, data: &KeyValue, app_state: &web::Data<AppState>) -> Result<(), reqwest::Error> {
+async fn broadcast_write(
+    method: &str,
+    key: &str,
+    data: &KeyValue,
+    app_state: &web::Data<AppState>,
+) -> Result<(), reqwest::Error> {
     let client = Client::builder().timeout(Duration::from_secs(1)).build()?;
     let current_replica = &app_state.socket_address;
 
@@ -367,9 +432,12 @@ async fn broadcast_write(method: &str, key: &str, data: &KeyValue, app_state: &w
     Ok(())
 }
 
-// Internal PUT endpoint for replication
 #[put("/internal/kvs/{key}")]
-async fn internal_put(key: web::Path<String>, item: web::Json<KeyValue>, data: web::Data<AppState>) -> impl Responder {
+async fn internal_put(
+    key: web::Path<String>,
+    item: web::Json<KeyValue>,
+    data: web::Data<AppState>,
+) -> impl Responder {
     let key_str = key.into_inner();
 
     let mut store = data.store.lock().unwrap();
@@ -384,9 +452,12 @@ async fn internal_put(key: web::Path<String>, item: web::Json<KeyValue>, data: w
     HttpResponse::Ok().json(json!({ "result": "updated", "causal-metadata": *vector_clock }))
 }
 
-// Internal DELETE endpoint for replication
 #[delete("/internal/kvs/{key}")]
-async fn internal_delete(key: web::Path<String>, req_body: web::Json<DeleteRequest>, data: web::Data<AppState>) -> impl Responder {
+async fn internal_delete(
+    key: web::Path<String>,
+    req_body: web::Json<DeleteRequest>,
+    data: web::Data<AppState>,
+) -> impl Responder {
     let key_str = key.into_inner();
     let causal_metadata = req_body.into_inner().causal_metadata.unwrap_or_default();
 
@@ -398,12 +469,16 @@ async fn internal_delete(key: web::Path<String>, req_body: web::Json<DeleteReque
     if store.remove(&key_str).is_some() {
         HttpResponse::Ok().json(json!({ "result": "deleted", "causal-metadata": *vector_clock }))
     } else {
-        HttpResponse::NotFound().json(json!({ "error": "Key does not exist", "causal-metadata": *vector_clock }))
+        HttpResponse::NotFound()
+            .json(json!({ "error": "Key does not exist", "causal-metadata": *vector_clock }))
     }
 }
 
 #[put("/internal/view")]
-async fn put_internal_view(req: web::Json<InternalViewRequest>, state: web::Data<AppState>) -> impl Responder {
+async fn put_internal_view(
+    req: web::Json<InternalViewRequest>,
+    state: web::Data<AppState>,
+) -> impl Responder {
     let mut replicas = state.replicas.lock().unwrap();
     let mut last_heartbeat_received = state.last_heartbeat_received.lock().unwrap();
 
@@ -413,11 +488,11 @@ async fn put_internal_view(req: web::Json<InternalViewRequest>, state: web::Data
                 replicas.push(req.socket_address.clone());
                 last_heartbeat_received.insert(req.socket_address.clone(), Instant::now());
             }
-        },
+        }
         Some("delete") => {
             replicas.retain(|replica| replica != &req.socket_address);
             last_heartbeat_received.remove(&req.socket_address);
-        },
+        }
         _ => (),
     }
 
@@ -425,7 +500,10 @@ async fn put_internal_view(req: web::Json<InternalViewRequest>, state: web::Data
 }
 
 #[delete("/internal/view")]
-async fn delete_internal_view(req: web::Json<InternalViewRequest>, state: web::Data<AppState>) -> impl Responder {
+async fn delete_internal_view(
+    req: web::Json<InternalViewRequest>,
+    state: web::Data<AppState>,
+) -> impl Responder {
     let mut replicas = state.replicas.lock().unwrap();
     let mut last_heartbeat_received = state.last_heartbeat_received.lock().unwrap();
 
@@ -441,8 +519,8 @@ async fn get_internal_state(state: web::Data<AppState>) -> impl Responder {
     let vector_clock = state.vector_clock.lock().unwrap();
 
     HttpResponse::Ok().json(json!({
-        "keyValueStore": &*store,
-        "globalVectorClock": &*vector_clock
+        "key_value_store": &*store,
+        "global_vector_clock": &*vector_clock
     }))
 }
 
@@ -455,30 +533,39 @@ async fn announce_presence(state: web::Data<AppState>) {
     for replica in replicas.iter() {
         if replica != current_replica {
             if !state_transferred {
-                match client.get(format!("http://{}/internal/state", replica)).send().await {
+                match client
+                    .get(format!("http://{}/internal/state", replica))
+                    .send()
+                    .await
+                {
                     Ok(response) => {
                         if let Ok(data) = response.json::<StateResponse>().await {
                             let mut vector_clock = state.vector_clock.lock().unwrap();
-                            for (key, value) in data.globalVectorClock.iter() {
-                                vector_clock.entry(key.clone()).and_modify(|e| *e = std::cmp::max(*e, *value)).or_insert(*value);
+                            for (key, value) in data.global_vector_clock.iter() {
+                                vector_clock
+                                    .entry(key.clone())
+                                    .and_modify(|e| *e = std::cmp::max(*e, *value))
+                                    .or_insert(*value);
                             }
 
                             let mut store = state.store.lock().unwrap();
-                            *store = data.keyValueStore;
+                            *store = data.key_value_store;
 
                             state_transferred = true;
                         }
-                    },
+                    }
                     Err(e) => error!("Error requesting state from {}: {}", replica, e),
                 }
             }
 
-            // Announce presence
-            let announcement = serde_json::json!({ "socket-address": current_replica, "action": "add" });
-            match client.put(format!("http://{}/internal/view", replica))
-                       .json(&announcement)
-                       .send()
-                       .await {
+            let announcement =
+                serde_json::json!({ "socket-address": current_replica, "action": "add" });
+            match client
+                .put(format!("http://{}/internal/view", replica))
+                .json(&announcement)
+                .send()
+                .await
+            {
                 Ok(_) => info!("Announced presence to {}", replica),
                 Err(e) => error!("Error announcing presence to {}: {}", replica, e),
             }
@@ -506,8 +593,9 @@ async fn main() -> std::io::Result<()> {
         last_heartbeat_received: Mutex::new(HashMap::new()),
     });
 
-    let heartbeat_handle = tokio::spawn(send_heartbeats(app_data.clone()));
-    let check_replicas_handle = tokio::spawn(check_for_failed_replicas(app_data.clone()));
+    // Ignore unused variable warnings, these are intentional tasks that are running concurrently and independently of the main server task
+    let _heartbeat_handle = tokio::spawn(send_heartbeats(app_data.clone()));
+    let _check_replicas_handle = tokio::spawn(check_for_failed_replicas(app_data.clone()));
 
     let app_data_for_server = app_data.clone();
 
@@ -533,7 +621,13 @@ async fn main() -> std::io::Result<()> {
     let announce_handle = tokio::spawn(announce_presence(app_data));
 
     // Wait for both the server and the announce_presence task
-    tokio::join!(server, announce_handle);
+    let (server_result, announce_result) = tokio::join!(server, announce_handle);
+    if let Err(e) = server_result {
+        error!("Error in server task: {}", e);
+    }
+    if let Err(e) = announce_result {
+        error!("Error in announce task: {}", e);
+    }
 
     Ok(())
 }
