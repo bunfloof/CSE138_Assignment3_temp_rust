@@ -57,7 +57,12 @@ struct AppState {
     vector_clock: Arc<Mutex<HashMap<String, u64>>>,
     replicas: Arc<Mutex<Vec<String>>>,
     socket_address: String,
-    last_heartbeat_received: Mutex<HashMap<String, Instant>>,
+    last_heartbeat_received: Mutex<HashMap<String, Instant>>, // Tracking last heartbeat times
+}
+
+// Utility function to initialize the vector clock
+fn initialize_vector_clock(replicas: &[String]) -> HashMap<String, u64> {
+    replicas.iter().map(|replica| (replica.clone(), 0)).collect()
 }
 
 // Utility function to update the vector clock
@@ -108,7 +113,7 @@ async fn send_heartbeats(state: web::Data<AppState>) {
                         .json(&Heartbeat {
                             socket_address: state_clone.socket_address.clone(),
                         })
-                        .timeout(Duration::from_millis(500)) // set a timeout of 500ms for the request
+                        .timeout(Duration::from_millis(500)) // set a timeout of 500 ms for the request
                         .send()
                         .await;
                     let elapsed = start.elapsed();
@@ -136,7 +141,7 @@ async fn check_for_failed_replicas(state: web::Data<AppState>) {
                 true // Always keep the current replica
             } else if let Some(last_heartbeat) = last_heartbeat_received.get(replica) {
                 if now.duration_since(*last_heartbeat) <= Duration::from_secs(3) {
-                    true // Keep the replica, as it's within the heartbeat timeout
+                    true // Keep the replica because it's within the heartbeat timeout
                 } else {
                     info!("Replica {} is down and removed from view.", replica);
                     false // Remove the replica
@@ -149,7 +154,6 @@ async fn check_for_failed_replicas(state: web::Data<AppState>) {
         });
     }
 }
-
 
 #[put("/heartbeat")]
 async fn receive_heartbeat(req: web::Json<Heartbeat>, state: web::Data<AppState>) -> impl Responder {
@@ -170,7 +174,13 @@ async fn put_view(req: web::Json<ViewRequest>, state: web::Data<AppState>) -> im
 
     if !replicas.contains(&req.socket_address) {
         replicas.push(req.socket_address.clone());
-        // broadcast view change not coems
+        drop(replicas); // Release the lock before broadcasting
+
+        if let Err(e) = broadcast_view_change(&state, "add", &req.socket_address).await {
+            error!("Error broadcasting view addition: {}", e);
+            return HttpResponse::InternalServerError().finish();
+        }
+
         HttpResponse::Created().json(json!({ "result": "added" }))
     } else {
         HttpResponse::Ok().json(json!({ "result": "already present" }))
@@ -183,7 +193,13 @@ async fn delete_view(req: web::Json<ViewRequest>, state: web::Data<AppState>) ->
 
     if let Some(pos) = replicas.iter().position(|r| r == &req.socket_address) {
         replicas.remove(pos);
-        // broadcast view change not coems
+        drop(replicas); // Release the lock before broadcasting
+
+        if let Err(e) = broadcast_view_change(&state, "delete", &req.socket_address).await {
+            error!("Error broadcasting view deletion: {}", e);
+            return HttpResponse::InternalServerError().finish();
+        }
+
         HttpResponse::Ok().json(json!({ "result": "deleted" }))
     } else {
         HttpResponse::NotFound().json(json!({ "error": "View has no such replica" }))
@@ -285,6 +301,40 @@ async fn delete(key: web::Path<String>, req_body: web::Json<DeleteRequest>, data
     }
 }
 
+async fn broadcast_view_change(app_state: &web::Data<AppState>, method: &str, socket_address: &str) -> Result<(), reqwest::Error> {
+    let client = Client::new();
+    let current_replica = &app_state.socket_address;
+
+    let replicas = app_state.replicas.lock().unwrap().clone(); // Clone to release the lock immediately
+    let mut broadcast_tasks = Vec::new();
+
+    for replica in replicas.iter() {
+        if replica != current_replica {
+            let url = format!("http://{}/internal/view", replica);
+            let client_clone = client.clone(); // Clone the client for each request
+            let payload = serde_json::json!({ "socket-address": socket_address, "action": method });
+
+            let task = tokio::spawn(async move {
+                match client_clone.put(&url).json(&payload).timeout(Duration::from_secs(1)).send().await {
+                    Ok(_) => info!("Broadcast to {} successful.", url),
+                    Err(e) => error!("Error broadcasting view change to {}: {}", url, e),
+                }
+            });
+
+            broadcast_tasks.push(task);
+        }
+    }
+
+    // Wait for all broadcast tasks to complete
+    for task in broadcast_tasks {
+        let _ = task.await;
+    }
+
+    Ok(())
+}
+
+
+// Function to broadcast write operations with error handling and logging
 async fn broadcast_write(method: &str, key: &str, data: &KeyValue, app_state: &web::Data<AppState>) -> Result<(), reqwest::Error> {
     let client = Client::builder().timeout(Duration::from_secs(1)).build()?;
     let current_replica = &app_state.socket_address;
@@ -317,6 +367,7 @@ async fn broadcast_write(method: &str, key: &str, data: &KeyValue, app_state: &w
     Ok(())
 }
 
+// Internal PUT endpoint for replication
 #[put("/internal/kvs/{key}")]
 async fn internal_put(key: web::Path<String>, item: web::Json<KeyValue>, data: web::Data<AppState>) -> impl Responder {
     let key_str = key.into_inner();
@@ -333,6 +384,7 @@ async fn internal_put(key: web::Path<String>, item: web::Json<KeyValue>, data: w
     HttpResponse::Ok().json(json!({ "result": "updated", "causal-metadata": *vector_clock }))
 }
 
+// Internal DELETE endpoint for replication
 #[delete("/internal/kvs/{key}")]
 async fn internal_delete(key: web::Path<String>, req_body: web::Json<DeleteRequest>, data: web::Data<AppState>) -> impl Responder {
     let key_str = key.into_inner();
@@ -484,8 +536,4 @@ async fn main() -> std::io::Result<()> {
     tokio::join!(server, announce_handle);
 
     Ok(())
-}
-
-fn initialize_vector_clock(replicas: &[String]) -> HashMap<String, u64> {
-    replicas.iter().map(|replica| (replica.clone(), 0)).collect()
 }
