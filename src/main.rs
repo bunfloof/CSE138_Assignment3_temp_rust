@@ -248,6 +248,10 @@ async fn put(
         return HttpResponse::BadRequest().json(json!({ "error": "Key is too long" }));
     }
 
+    if item.value == serde_json::Value::Null || item.value.as_str().map_or(false, |v| v.is_empty()) {
+        return HttpResponse::BadRequest().json(json!({ "error": "PUT request does not specify a value" }));
+    }
+    
     let mut store_lock = data.store.lock().unwrap();
 
     {
